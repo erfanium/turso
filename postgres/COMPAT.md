@@ -192,7 +192,7 @@ INTEGER. Unknown type names pass through as custom types.
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
-| SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
+| SYSTEM_USER | ❌ Not supported | current_user/current_role return the role set with SET ROLE, or `turso` |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
@@ -372,7 +372,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE not supported at all |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE are accepted but silently ignored — privileges are not checked, every role can read and write every table |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -386,8 +386,8 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes a single hardcoded `turso` role |
-| Row-level security | ❌ Not supported | |
+| ROLES | 🟡 Partial | `CREATE ROLE` (no options), `DROP ROLE [IF EXISTS]` (one role), `SET ROLE` / `SET ROLE NONE` / `RESET ROLE`; `SET LOCAL ROLE` rejected. Roles are stored per database, not per cluster. Every session connects as the superuser `turso`; created roles are not superusers, have no privileges model (see GRANT), and do not show up in pg_roles |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE/FORCE/NO FORCE ROW LEVEL SECURITY`, `CREATE POLICY` (PERMISSIVE/RESTRICTIVE, FOR ALL/SELECT/INSERT/UPDATE/DELETE, TO roles/PUBLIC, USING, WITH CHECK), `DROP POLICY`. Enforced for SELECT, UPDATE, DELETE and INSERT (including subqueries, joins and views) after `SET ROLE`; foreign-key actions and VACUUM bypass policies like in PostgreSQL. A failed WITH CHECK aborts the statement. Recursive policies are reported as errors. Not supported: `ALTER POLICY`; FORCE (has no effect because table owners are not tracked and the session user is a superuser); subqueries in policy expressions that check new rows (rejected by CREATE POLICY, and SELECT policies with subqueries make UPDATE ... WHERE and INSERT ... RETURNING fail); parameters and WITH in policy expressions (rejected); on tables with row-level security, INSERT ... ON CONFLICT, OR REPLACE and UPDATE that can replace rows (including through `ON CONFLICT REPLACE` constraints), FULL JOIN, RENAME, and DROP/RENAME/ALTER COLUMN while policies exist (all rejected); tables in schemas other than `public` (rejected); leakproof functions (policy predicates are evaluated before user predicates on the same table, but the planner does not guarantee it). Views are checked as the querying role, not the view owner. pg_policy is still empty |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |

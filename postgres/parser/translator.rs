@@ -172,6 +172,9 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
+            NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
+            NodeRef::DropRoleStmt(role) => translate_drop_role(role)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -727,6 +730,18 @@ impl PostgreSQLTranslator {
                     "ALTER TABLE ADD CONSTRAINT is not supported".into(),
                 ));
             }
+            AlterTableType::AtEnableRowSecurity => {
+                ast::AlterTableBody::RowSecurity(ast::RowSecurityChange::Enable)
+            }
+            AlterTableType::AtDisableRowSecurity => {
+                ast::AlterTableBody::RowSecurity(ast::RowSecurityChange::Disable)
+            }
+            AlterTableType::AtForceRowSecurity => {
+                ast::AlterTableBody::RowSecurity(ast::RowSecurityChange::Force)
+            }
+            AlterTableType::AtNoForceRowSecurity => {
+                ast::AlterTableBody::RowSecurity(ast::RowSecurityChange::NoForce)
+            }
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "ALTER TABLE {} is not supported",
@@ -736,6 +751,47 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Stmt::AlterTable(ast::AlterTable { name, body }))
+    }
+
+    fn translate_create_policy(
+        &self,
+        policy: &pg_query::protobuf::CreatePolicyStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let table = policy
+            .table
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("CREATE POLICY missing table".into()))?;
+        let command = match policy.cmd_name.as_str() {
+            "all" => ast::PolicyCommand::All,
+            "select" => ast::PolicyCommand::Select,
+            "insert" => ast::PolicyCommand::Insert,
+            "update" => ast::PolicyCommand::Update,
+            "delete" => ast::PolicyCommand::Delete,
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "CREATE POLICY FOR {other} is not supported"
+                )))
+            }
+        };
+        let using_expr = policy
+            .qual
+            .as_ref()
+            .map(|expr| self.translate_expr(expr).map(Box::new))
+            .transpose()?;
+        let check_expr = policy
+            .with_check
+            .as_ref()
+            .map(|expr| self.translate_expr(expr).map(Box::new))
+            .transpose()?;
+        Ok(ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
+            policy_name: ast::Name::from_string(&policy.policy_name),
+            tbl_name: self.qualified_name_from_range_var(table),
+            restrictive: !policy.permissive,
+            command,
+            roles: policy_roles(&policy.roles)?,
+            using_expr,
+            check_expr,
+        })))
     }
 
     fn translate_rename_stmt(
@@ -916,6 +972,9 @@ impl PostgreSQLTranslator {
 
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
+        if remove_type == ObjectType::ObjectPolicy {
+            return translate_drop_policy(drop);
+        }
 
         // Extract the first qualified name from drop.objects
         let obj_node = drop
@@ -1777,11 +1836,8 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
-        let qualified_name = self.qualified_name_from_range_var(range_var);
-        let alias = range_var
-            .alias
-            .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        let mut qualified_name = self.qualified_name_from_range_var(range_var);
+        let alias = qualified_name.alias.take().map(ast::As::Elided);
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -2325,13 +2381,30 @@ impl PostgreSQLTranslator {
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
-                        | SqlValueFunctionOp::SvfopSessionUser
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
-                    ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
-                    }
+                    ) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_user"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
+                    Ok(SqlValueFunctionOp::SvfopSessionUser) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("session_user"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
@@ -4216,6 +4289,92 @@ struct PgForeignKey {
 
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
 /// an ENCODE expression that validates values against the enum labels.
+fn translate_drop_policy(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    if drop.objects.len() != 1 {
+        return Err(ParseError::ParseError(
+            "DROP POLICY of more than one policy is not supported".into(),
+        ));
+    }
+    let names: Vec<String> = match &drop.objects[0].node {
+        Some(Node::List(list)) => list
+            .items
+            .iter()
+            .filter_map(|item| match &item.node {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let tbl_name = match names.as_slice() {
+        [table, _] => ast::QualifiedName::single(ast::Name::from_string(table)),
+        [schema, table, _] => ast::QualifiedName::fullname(
+            ast::Name::from_string(schema),
+            ast::Name::from_string(table),
+        ),
+        _ => return Err(ParseError::ParseError("DROP POLICY: invalid name".into())),
+    };
+    let policy_name = names.last().expect("matched above");
+    Ok(ast::Stmt::DropPolicy {
+        if_exists: drop.missing_ok,
+        policy_name: ast::Name::from_string(policy_name),
+        tbl_name,
+    })
+}
+
+fn translate_create_role(
+    role: &pg_query::protobuf::CreateRoleStmt,
+) -> Result<ast::Stmt, ParseError> {
+    if !role.options.is_empty() {
+        return Err(ParseError::ParseError(
+            "CREATE ROLE options are not supported".into(),
+        ));
+    }
+    Ok(ast::Stmt::CreateRole {
+        role_name: ast::Name::from_string(&role.role),
+    })
+}
+
+fn translate_drop_role(role: &pg_query::protobuf::DropRoleStmt) -> Result<ast::Stmt, ParseError> {
+    let mut roles = policy_roles(&role.roles)?;
+    if roles.len() != 1 {
+        return Err(ParseError::ParseError(
+            "DROP ROLE supports exactly one role name".into(),
+        ));
+    }
+    Ok(ast::Stmt::DropRole {
+        if_exists: role.missing_ok,
+        role_name: roles.remove(0),
+    })
+}
+
+/// Role names of a `TO` list. `PUBLIC` covers every role, which the native
+/// statement represents with an empty list.
+fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Name>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::RoleSpecType;
+
+    let mut names = Vec::new();
+    for role in roles {
+        let Some(Node::RoleSpec(spec)) = &role.node else {
+            return Err(ParseError::ParseError("expected a role name".into()));
+        };
+        match RoleSpecType::try_from(spec.roletype) {
+            Ok(RoleSpecType::RolespecCstring) => names.push(ast::Name::from_string(&spec.rolename)),
+            Ok(RoleSpecType::RolespecPublic) => return Ok(Vec::new()),
+            _ => {
+                return Err(ParseError::ParseError(
+                    "CURRENT_ROLE, CURRENT_USER and SESSION_USER role names are not supported"
+                        .into(),
+                ))
+            }
+        }
+    }
+    Ok(names)
+}
+
 fn translate_create_enum(
     enum_stmt: &pg_query::protobuf::CreateEnumStmt,
 ) -> Result<ast::Stmt, ParseError> {
@@ -4596,6 +4755,51 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         name: set_stmt.name.clone(),
         values,
     })
+}
+
+/// `SET ROLE name`, `SET ROLE NONE` or `RESET ROLE`.
+pub struct PgSetRoleStmt {
+    /// `None` for `SET ROLE NONE` and `RESET ROLE`.
+    pub role: Option<String>,
+    /// `SET LOCAL ROLE`
+    pub is_local: bool,
+}
+
+pub fn try_extract_set_role(parse_result: &ParseResult) -> Option<PgSetRoleStmt> {
+    use pg_query::protobuf::VariableSetKind;
+    use pg_query::NodeRef;
+
+    let node = parse_result.protobuf.nodes().into_iter().next()?;
+    let NodeRef::VariableSetStmt(set_stmt) = node.0 else {
+        return None;
+    };
+    if set_stmt.name != "role" {
+        return None;
+    }
+    let role = match VariableSetKind::try_from(set_stmt.kind) {
+        Ok(VariableSetKind::VarReset) => None,
+        Ok(VariableSetKind::VarSetValue) => match set_stmt.args.as_slice() {
+            [arg] => match PgSetValue::from_node(arg)? {
+                PgSetValue::StringLiteral(name) | PgSetValue::Identifier(name) => {
+                    (name != "none").then_some(name)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(PgSetRoleStmt {
+        role,
+        is_local: set_stmt.is_local,
+    })
+}
+
+pub fn is_grant_or_revoke(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    !nodes.is_empty() && matches!(&nodes[0].0, NodeRef::GrantStmt(_))
 }
 
 /// Try to extract a SHOW statement from a PG parse result.
@@ -7469,5 +7673,81 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_create_policy_prints_sql_the_native_parser_reads_back() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE POLICY p ON docs AS RESTRICTIVE FOR UPDATE TO alice, bob \
+                   USING (team IN (SELECT m.team FROM members m WHERE m.member = current_user)) \
+                   WITH CHECK (owner = current_user)";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        let printed = stmt.to_string();
+        assert_eq!(
+            printed,
+            "CREATE POLICY p ON docs AS RESTRICTIVE FOR UPDATE TO alice, bob \
+             USING (team IN (SELECT m.team FROM members m WHERE m.member = current_user ())) \
+             WITH CHECK (owner = current_user ())"
+        );
+        let reparsed = turso_parser::parser::Parser::new(printed.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reparsed.stmt().to_string(), printed);
+    }
+
+    #[test]
+    fn test_create_policy_to_public_has_no_roles() {
+        let translator = PostgreSQLTranslator::new();
+        let parse_result = crate::parse("CREATE POLICY p ON docs TO PUBLIC USING (true)").unwrap();
+        let ast::Stmt::CreatePolicy(policy) = translator.translate(&parse_result).unwrap() else {
+            panic!("expected CREATE POLICY");
+        };
+        assert!(policy.roles.is_empty());
+        assert!(!policy.restrictive);
+        assert_eq!(policy.command, ast::PolicyCommand::All);
+    }
+
+    #[test]
+    fn test_drop_policy_and_row_security_changes() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "DROP POLICY IF EXISTS p ON docs",
+                "DROP POLICY IF EXISTS p ON docs",
+            ),
+            ("DROP POLICY p ON s.docs", "DROP POLICY p ON s.docs"),
+            (
+                "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+                "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+            ),
+            (
+                "ALTER TABLE docs NO FORCE ROW LEVEL SECURITY",
+                "ALTER TABLE docs NO FORCE ROW LEVEL SECURITY",
+            ),
+            ("CREATE ROLE alice", "CREATE ROLE alice"),
+            ("DROP ROLE IF EXISTS alice", "DROP ROLE IF EXISTS alice"),
+        ] {
+            let parse_result = crate::parse(sql).unwrap();
+            let stmt = translator.translate(&parse_result).unwrap();
+            assert_eq!(stmt.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_set_role_extraction() {
+        for (sql, expected) in [
+            ("SET ROLE alice", Some("alice")),
+            ("SET ROLE NONE", None),
+            ("RESET ROLE", None),
+        ] {
+            let parse_result = crate::parse(sql).unwrap();
+            let set_role = try_extract_set_role(&parse_result).unwrap();
+            assert_eq!(set_role.role.as_deref(), expected, "{sql}");
+            assert!(!set_role.is_local);
+        }
+        let parse_result = crate::parse("SET search_path TO public").unwrap();
+        assert!(try_extract_set_role(&parse_result).is_none());
     }
 }
