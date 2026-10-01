@@ -1,4 +1,5 @@
 use crate::schema::ColumnLayout;
+use crate::translate::access_control::{emit_row_security_checks, row_security_applies};
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
 use crate::{
@@ -31,7 +32,9 @@ use crate::{
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
-        stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
+        stmt_journal::{
+            any_effective_replace, any_index_or_ipk_has_replace, set_insert_stmt_journal_flags,
+        },
         subquery::{
             emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
             plan_subqueries_from_returning,
@@ -57,8 +60,8 @@ use gencol::compute_virtual_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
-    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo, With,
+    self, Expr, InsertBody, OneSelect, PolicyCommand, QualifiedName, ResolveType, ResultColumn,
+    TriggerEvent, TriggerTime, Upsert, UpsertDo, With,
 };
 
 /// Validate anything with this insert statement that should throw an early parse error
@@ -374,6 +377,25 @@ pub fn translate_insert(
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    let row_security = row_security_applies(&btree_table.name, database_id, resolver)?;
+    let replaces_rows = any_effective_replace(
+        on_conflict.is_some(),
+        on_conflict.unwrap_or(ResolveType::Abort),
+        btree_table.rowid_alias_conflict_clause,
+        resolver
+            .with_schema(database_id, |s| {
+                s.get_indices(&btree_table.name)
+                    .map(|index| index.on_conflict)
+                    .collect::<Vec<_>>()
+            })
+            .into_iter(),
+    );
+    if row_security && (replaces_rows || !upsert_actions.is_empty()) {
+        crate::bail_parse_error!(
+            "INSERT with REPLACE or ON CONFLICT on table \"{}\" with row-level security is not supported",
+            btree_table.name
+        );
+    }
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
             || resolver.with_schema(database_id, |s| {
@@ -843,6 +865,31 @@ pub fn translate_insert(
         Some(&table_references),
     )?;
 
+    let row_security_commands = if result_columns.is_empty() {
+        vec![PolicyCommand::Insert]
+    } else {
+        vec![PolicyCommand::Insert, PolicyCommand::Select]
+    };
+    emit_row_security_checks(
+        program,
+        resolver,
+        ctx.table,
+        database_id,
+        &row_security_commands,
+        insertion.key_register(),
+        insertion.col_mappings.iter().filter_map(|m| {
+            m.column.name.as_deref().map(|n| {
+                let reg = if m.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    m.register
+                };
+                (n, reg)
+            })
+        }),
+        &table_references,
+    )?;
+
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,
     let constraints = build_constraints_to_check(
@@ -1231,6 +1278,7 @@ pub fn translate_insert(
             btree_table.has_autoincrement,
             notnull_col_exists,
             has_unique,
+            row_security,
         );
     }
 

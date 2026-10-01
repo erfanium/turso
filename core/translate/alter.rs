@@ -20,6 +20,7 @@ use crate::{
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
+        access_control,
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
@@ -904,6 +905,7 @@ pub fn translate_alter_table(
     match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
             reject_dependent_materialized_views(resolver, database_id, table_name)?;
+            access_control::reject_column_change_of_table_with_policies(table_name, resolver)?;
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
@@ -1554,8 +1556,17 @@ pub fn translate_alter_table(
                 },
             )?
         }
+        ast::AlterTableBody::RowSecurity(change) => {
+            access_control::translate_row_security_change(
+                &qualified_name,
+                change,
+                resolver,
+                program,
+            )?;
+        }
         ast::AlterTableBody::RenameTo(new_name) => {
             reject_dependent_materialized_views(resolver, database_id, table_name)?;
+            access_control::reject_rename_of_table_with_row_security(table_name, resolver)?;
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
@@ -1798,6 +1809,7 @@ pub fn translate_alter_table(
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
             reject_dependent_materialized_views(resolver, database_id, table_name)?;
+            access_control::reject_column_change_of_table_with_policies(table_name, resolver)?;
             let from;
             let definition;
             let col_name;

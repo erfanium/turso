@@ -183,6 +183,10 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
+    /// Role whose row-level security policies apply to the statement being
+    /// compiled. `None` bypasses row-level security: the superuser, statements
+    /// the engine runs on its own behalf, and foreign-key actions.
+    pub(crate) row_security_role: Option<String>,
     /// When set, we are compiling a trigger subprogram for this database.
     /// Ordinary triggers are restricted to their own database, but temp-backed
     /// triggers follow SQLite's looser resolution rules and may access objects
@@ -310,6 +314,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
+            row_security_role: None,
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -355,6 +360,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
+            row_security_role: self.row_security_role.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -382,6 +388,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
+            row_security_role: self.row_security_role.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -2315,7 +2322,37 @@ pub(crate) fn emit_check_constraints<'a>(
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
     }
+    with_new_row_registers_cached(
+        resolver,
+        table_name,
+        rowid_reg,
+        column_mappings,
+        referenced_tables,
+        |resolver| {
+            emit_check_constraint_bytecode(
+                program,
+                check_constraints,
+                resolver,
+                or_conflict,
+                skip_row_label,
+                referenced_tables,
+                table_name,
+            )
+        },
+    )
+}
 
+/// Run `emit` with the resolver mapping the columns of the row being written
+/// (unqualified, qualified by `table_name`, and bound to the first table of
+/// `referenced_tables`) to the registers holding the new values.
+pub(crate) fn with_new_row_registers_cached<'a>(
+    resolver: &mut Resolver,
+    table_name: &str,
+    rowid_reg: usize,
+    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    referenced_tables: Option<&TableReferences>,
+    emit: impl FnOnce(&mut Resolver) -> Result<()>,
+) -> Result<()> {
     let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
     let initial_cache_size = resolver.expr_to_reg_cache.len();
     let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
@@ -2387,15 +2424,7 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-    );
+    let result = emit(resolver);
 
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);

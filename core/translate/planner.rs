@@ -111,7 +111,7 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
-fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+pub(crate) fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }
@@ -468,7 +468,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
-fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
+pub(crate) fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
     let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
         match node {
             Expr::Exists(select) | Expr::Subquery(select) => {

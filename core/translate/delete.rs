@@ -1,5 +1,6 @@
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
+use crate::translate::access_control::add_row_security_filter;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
@@ -17,7 +18,9 @@ use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{
+    Expr, PolicyCommand, QualifiedName, RefAct, ResultColumn, TriggerEvent, With,
+};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -225,6 +228,20 @@ pub fn prepare_delete_plan(
     plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
     let mut where_predicates = vec![];
+
+    let row_security_commands = if where_clause.is_some() || !returning.is_empty() {
+        vec![PolicyCommand::Delete, PolicyCommand::Select]
+    } else {
+        vec![PolicyCommand::Delete]
+    };
+    let target_internal_id = table_references.joined_tables()[0].internal_id;
+    add_row_security_filter(
+        &mut table_references,
+        target_internal_id,
+        &row_security_commands,
+        &mut where_predicates,
+        resolver,
+    )?;
 
     // Parse the WHERE clause
     parse_where(

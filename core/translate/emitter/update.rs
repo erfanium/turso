@@ -2,6 +2,7 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
+use crate::translate::access_control::emit_row_security_checks;
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -60,7 +61,7 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
+use turso_parser::ast::{PolicyCommand, RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -455,6 +456,7 @@ pub fn emit_program_for_update(
         resolver,
         returning_buffer.as_ref(),
         &mut update_subqueries,
+        &plan.row_security_commands,
     )?;
 
     // Close the main loop
@@ -1055,6 +1057,7 @@ fn emit_update_insns<'a>(
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+    row_security_commands: &[PolicyCommand],
 ) -> crate::Result<()> {
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
@@ -1764,6 +1767,29 @@ fn emit_update_insns<'a>(
                 Some(&check_constraint_tables),
             )?;
         }
+
+        emit_row_security_checks(
+            program,
+            &mut t_ctx.resolver,
+            &btree_table,
+            target_table.database_id,
+            row_security_commands,
+            effective_rowid_reg,
+            btree_table
+                .columns()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| {
+                    col.name.as_deref().map(|n| {
+                        if col.is_rowid_alias() {
+                            (n, effective_rowid_reg)
+                        } else {
+                            (n, layout.to_register(start, idx))
+                        }
+                    })
+                }),
+            &TableReferences::new(vec![target_table.as_ref().clone()], vec![]),
+        )?;
     }
 
     // =========================================================================

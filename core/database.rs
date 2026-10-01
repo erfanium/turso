@@ -1668,6 +1668,22 @@ impl Database {
                         }
                     }
 
+                    conn.maybe_update_schema();
+                    let access_control_sqls = conn.query_stored_access_control_statements()?;
+                    if !access_control_sqls.is_empty() {
+                        let catalog = Arc::new(crate::access_control::AccessControlCatalog::load(
+                            &access_control_sqls,
+                        )?);
+                        let db = state
+                            .db
+                            .as_ref()
+                            .expect("db must be initialized in Init phase");
+                        db.with_schema_mut(|schema| {
+                            schema.access_control = catalog;
+                            Ok(())
+                        })?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }
 
@@ -2610,6 +2626,7 @@ impl Database {
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
+            current_role: RwLock::new(None),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

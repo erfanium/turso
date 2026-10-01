@@ -136,6 +136,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
+    has_row_security_checks: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
         s.get_indices(&table.name)
@@ -168,6 +169,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
         || has_fks
         || autoinc_may_abort_multi_row
         || has_upsert_do_update
+        || has_row_security_checks
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
@@ -249,8 +251,14 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
+    let has_row_security_checks = crate::translate::access_control::row_security_applies(
+        &btree_table.name,
+        database_id,
+        resolver,
+    )?;
     let may_abort = has_triggers
         || has_fks
+        || has_row_security_checks
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,

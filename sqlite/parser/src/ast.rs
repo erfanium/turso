@@ -359,6 +359,29 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: Name,
+    },
+    /// `DROP ROLE`
+    DropRole {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// role name
+        role_name: Name,
+    },
+    /// `CREATE POLICY`
+    CreatePolicy(Box<CreatePolicy>),
+    /// `DROP POLICY`
+    DropPolicy {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// policy name
+        policy_name: Name,
+        /// table the policy belongs to
+        tbl_name: QualifiedName,
+    },
 }
 
 #[repr(transparent)]
@@ -1410,6 +1433,58 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `ENABLE`, `DISABLE`, `FORCE` or `NO FORCE ROW LEVEL SECURITY`
+    RowSecurity(RowSecurityChange),
+}
+
+/// Change made by `ALTER TABLE ... ROW LEVEL SECURITY`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RowSecurityChange {
+    /// `ENABLE ROW LEVEL SECURITY`
+    Enable,
+    /// `DISABLE ROW LEVEL SECURITY`
+    Disable,
+    /// `FORCE ROW LEVEL SECURITY`
+    Force,
+    /// `NO FORCE ROW LEVEL SECURITY`
+    NoForce,
+}
+
+/// `CREATE POLICY`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreatePolicy {
+    /// policy name
+    pub policy_name: Name,
+    /// table the policy belongs to
+    pub tbl_name: QualifiedName,
+    /// `AS RESTRICTIVE` (default is `AS PERMISSIVE`)
+    pub restrictive: bool,
+    /// `FOR` command
+    pub command: PolicyCommand,
+    /// `TO` roles; empty means `PUBLIC`
+    pub roles: Vec<Name>,
+    /// `USING` expression: which existing rows are visible
+    pub using_expr: Option<Box<Expr>>,
+    /// `WITH CHECK` expression: which new rows may be written
+    pub check_expr: Option<Box<Expr>>,
+}
+
+/// Command a policy applies to
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PolicyCommand {
+    /// `FOR ALL`
+    All,
+    /// `FOR SELECT`
+    Select,
+    /// `FOR INSERT`
+    Insert,
+    /// `FOR UPDATE`
+    Update,
+    /// `FOR DELETE`
+    Delete,
 }
 
 /// Operator mapping in a `CREATE TYPE` body

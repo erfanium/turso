@@ -980,6 +980,8 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// Commands whose row-level security policies the updated rows must satisfy.
+    pub row_security_commands: Vec<ast::PolicyCommand>,
 }
 
 impl UpdatePlan {

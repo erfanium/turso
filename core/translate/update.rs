@@ -1,12 +1,14 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::schema::{Index, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::translate::access_control::{add_row_security_filter, row_security_applies};
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -14,7 +16,7 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self, Expr, PolicyCommand, ResolveType};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -371,6 +373,11 @@ fn prepare_update_plan(
         connection,
     )?;
 
+    let target_internal_id = read_scope_tables.joined_tables()[0].internal_id;
+    let sets_read_target = body
+        .sets
+        .iter()
+        .any(|set| expr_reads_table(&set.expr, target_internal_id));
     let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
 
     let result_columns = if !body.returning.is_empty() {
@@ -412,6 +419,32 @@ fn prepare_update_plan(
         &mut where_clause,
         resolver,
     )?;
+    let row_security_commands =
+        if sets_read_target || body.where_clause.is_some() || !result_columns.is_empty() {
+            vec![PolicyCommand::Update, PolicyCommand::Select]
+        } else {
+            vec![PolicyCommand::Update]
+        };
+    add_row_security_filter(
+        &mut read_scope_tables,
+        target_internal_id,
+        &row_security_commands,
+        &mut where_clause,
+        resolver,
+    )?;
+    let from_internal_ids: Vec<_> = read_scope_tables.joined_tables()[1..]
+        .iter()
+        .map(|table| table.internal_id)
+        .collect();
+    for internal_id in from_internal_ids {
+        add_row_security_filter(
+            &mut read_scope_tables,
+            internal_id,
+            &[PolicyCommand::Select],
+            &mut where_clause,
+            resolver,
+        )?;
+    }
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
@@ -427,6 +460,14 @@ fn prepare_update_plan(
         columns,
         &set_clauses,
         &mut read_scope_tables,
+        resolver,
+    )?;
+    reject_replace_with_row_security(
+        &table,
+        database_id,
+        or_conflict,
+        &set_clauses,
+        &indexes_to_update,
         resolver,
     )?;
 
@@ -448,7 +489,60 @@ fn prepare_update_plan(
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
+        row_security_commands,
     })
+}
+
+/// REPLACE deletes the rows a new key conflicts with, which can be rows the
+/// policies hide from the role.
+fn reject_replace_with_row_security(
+    table: &Table,
+    database_id: usize,
+    or_conflict: Option<ResolveType>,
+    set_clauses: &[UpdateSetClause],
+    indexes_to_update: &[Arc<Index>],
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    let Some(btree) = table.btree() else {
+        return Ok(());
+    };
+    if !row_security_applies(&btree.name, database_id, resolver)? {
+        return Ok(());
+    }
+    let updates_rowid = set_clauses.iter().any(|set_clause| {
+        set_clause.column_index == ROWID_SENTINEL
+            || btree
+                .columns()
+                .get(set_clause.column_index)
+                .is_some_and(|column| column.is_rowid_alias())
+    });
+    let replaces_rows = any_effective_replace(
+        or_conflict.is_some(),
+        or_conflict.unwrap_or(ResolveType::Abort),
+        btree.rowid_alias_conflict_clause.filter(|_| updates_rowid),
+        indexes_to_update.iter().map(|index| index.on_conflict),
+    );
+    if replaces_rows {
+        bail_parse_error!(
+            "UPDATE with REPLACE on table \"{}\" with row-level security is not supported",
+            btree.name
+        );
+    }
+    Ok(())
+}
+
+fn expr_reads_table(expr: &Expr, internal_id: ast::TableInternalId) -> bool {
+    let mut reads = false;
+    let _ = walk_expr(expr, &mut |expr: &Expr| -> crate::Result<WalkControl> {
+        match expr {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } if *table == internal_id => {
+                reads = true;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    reads
 }
 
 fn collect_update_set_clauses(
