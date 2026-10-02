@@ -1213,25 +1213,44 @@ impl Statement {
             return Some(column_types.get(idx).expect("No column").to_string());
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
+        Self::column_expr_decltype(&column.expr, &self.program.table_references)
+    }
+
+    /// Declared type of a result expression that is a plain column reference.
+    ///
+    /// A column of a FROM-clause subquery or CTE that is itself a plain
+    /// column reference reports the declared type of the column it selects,
+    /// as SQLite does, rather than the affinity name of the subquery column.
+    fn column_expr_decltype(
+        expr: &turso_parser::ast::Expr,
+        table_references: &crate::translate::plan::TableReferences,
+    ) -> Option<String> {
+        let turso_parser::ast::Expr::Column {
+            table,
+            column: column_idx,
+            ..
+        } = expr
+        else {
+            return None;
+        };
+        let (_, table_ref) = table_references.find_table_by_internal_id(*table)?;
+        if let crate::schema::Table::FromClauseSubquery(subquery) = table_ref {
+            if let crate::translate::plan::Plan::Select(select) = subquery.plan.as_ref() {
+                if let Some(inner) = select.result_columns.get(*column_idx) {
+                    if let Some(ty) =
+                        Self::column_expr_decltype(&inner.expr, &select.table_references)
+                    {
+                        return Some(ty);
+                    }
                 }
             }
-            _ => None,
+        }
+        let table_column = table_ref.get_column_at(*column_idx)?;
+        let ty_str = &table_column.ty_str;
+        if ty_str.is_empty() {
+            None
+        } else {
+            Some(ty_str.clone())
         }
     }
 

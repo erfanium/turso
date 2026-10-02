@@ -5,7 +5,10 @@ use std::{
     str::FromStr as _,
 };
 
-use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
+use icu_collator::{
+    options::{CollatorOptions, Strength},
+    Collator, CollatorBorrowed,
+};
 use icu_locale::Locale;
 use turso_parser::ast::Expr;
 
@@ -274,10 +277,25 @@ impl LocaleCollationRegistry {
         let locale = Locale::from_str(name).map_err(|_| {
             crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
         })?;
-        let collator =
-            Collator::try_new(locale.into(), CollatorOptions::default()).map_err(|_| {
-                crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
-            })?;
+        // The comparison strength is not part of the collator preferences a
+        // locale carries, so the `ks` Unicode extension keyword is applied
+        // here: `und-u-ks-level1` compares base letters only, ignoring case
+        // and accents.
+        let mut options = CollatorOptions::default();
+        let lower = name.to_ascii_lowercase();
+        if let Some((_, level)) = lower.split_once("-ks-") {
+            options.strength = match level.split('-').next() {
+                Some("level1") => Some(Strength::Primary),
+                Some("level2") => Some(Strength::Secondary),
+                Some("level3") => Some(Strength::Tertiary),
+                Some("level4") => Some(Strength::Quaternary),
+                Some("identic") => Some(Strength::Identical),
+                _ => None,
+            };
+        }
+        let collator = Collator::try_new(locale.into(), options).map_err(|_| {
+            crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
+        })?;
 
         let mut collations = self.collations.write();
         if let Some((idx, _)) = collations
