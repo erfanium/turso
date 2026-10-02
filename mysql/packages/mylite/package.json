@@ -1,6 +1,6 @@
 {
   "name": "@erfanium/mylite",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "In-memory, in-process MySQL for Node.js — a drop-in for mysql2/promise, backed by the Turso engine. No server, no socket.",
   "license": "MIT",
   "main": "index.js",
