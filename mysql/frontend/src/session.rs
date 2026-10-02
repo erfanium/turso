@@ -1,0 +1,609 @@
+//! MySQL sessions over in-memory databases.
+//!
+//! An [`Engine`] owns a set of named in-memory databases. A database is
+//! created the first time a session selects it; when a template database is
+//! configured, a new database starts as a copy of the template, which gives
+//! every client that picks a unique database name an isolated, pre-seeded
+//! schema.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex};
+use turso_core::{Connection, Database, LimboError, Value};
+
+use crate::catalog::{Catalog, MyType};
+use crate::dialect::open_memory_database;
+use crate::rewrite::{rewrite, Kind, Rewritten};
+
+/// How long a writer waits for another transaction before failing with a
+/// lock wait timeout.
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Serializes the writers of one database.
+///
+/// The engine admits one write transaction at a time and reports a second
+/// one as busy, which a caller can only retry by polling. Queueing writers
+/// here instead hands the database over the moment the previous writer
+/// finishes.
+#[derive(Default)]
+struct WriteGate {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+impl WriteGate {
+    fn acquire(&self) -> Result<()> {
+        let mut held = self.held.lock();
+        let deadline = Instant::now() + LOCK_WAIT_TIMEOUT;
+        while *held {
+            if self.released.wait_until(&mut held, deadline).timed_out() && *held {
+                return Err(MyError::new(
+                    1205,
+                    "HY000",
+                    "Lock wait timeout exceeded; try restarting transaction",
+                ));
+            }
+        }
+        *held = true;
+        Ok(())
+    }
+
+    fn release(&self) {
+        *self.held.lock() = false;
+        self.released.notify_one();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MyError {
+    pub code: u16,
+    pub sqlstate: &'static str,
+    pub message: String,
+}
+
+impl MyError {
+    fn new(code: u16, sqlstate: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            sqlstate,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for MyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ERROR {} ({}): {}",
+            self.code, self.sqlstate, self.message
+        )
+    }
+}
+
+impl std::error::Error for MyError {}
+
+pub type Result<T> = std::result::Result<T, MyError>;
+
+fn engine_error(e: LimboError) -> MyError {
+    let message = e.to_string();
+    let lower = message.to_ascii_lowercase();
+    match e {
+        LimboError::Busy | LimboError::BusySnapshot | LimboError::TableLocked => MyError::new(
+            1205,
+            "HY000",
+            "Lock wait timeout exceeded; try restarting transaction",
+        ),
+        LimboError::Constraint(_) if lower.contains("unique") || lower.contains("primary key") => {
+            MyError::new(1062, "23000", format!("Duplicate entry for key: {message}"))
+        }
+        LimboError::Constraint(_) if lower.contains("not null") => {
+            MyError::new(1048, "23000", format!("Column cannot be null: {message}"))
+        }
+        _ if lower.contains("no such table") => MyError::new(1146, "42S02", message),
+        _ if lower.contains("no such column") => MyError::new(1054, "42S22", message),
+        LimboError::ParseError(_) => MyError::new(1064, "42000", message),
+        _ => MyError::new(1105, "HY000", message),
+    }
+}
+
+/// One named in-memory database.
+pub struct Db {
+    pub name: String,
+    database: Arc<Database>,
+    pub catalog: Catalog,
+    /// Native statements that built this database, replayed to clone it.
+    journal: Mutex<Vec<String>>,
+    write_gate: WriteGate,
+}
+
+pub struct Engine {
+    dbs: Mutex<HashMap<String, Arc<Db>>>,
+    template: Option<String>,
+}
+
+impl Engine {
+    pub fn new(template: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            dbs: Mutex::new(HashMap::new()),
+            template,
+        })
+    }
+
+    /// Forget a database. Its memory is freed once the last session using it
+    /// is gone; a later use of the same name starts from scratch.
+    pub fn drop_database(&self, name: &str) -> bool {
+        self.dbs.lock().remove(name).is_some()
+    }
+
+    fn database(&self, name: &str) -> Result<Arc<Db>> {
+        let mut dbs = self.dbs.lock();
+        if let Some(db) = dbs.get(name) {
+            return Ok(db.clone());
+        }
+        let database = open_memory_database(name).map_err(engine_error)?;
+        let db = Arc::new(Db {
+            name: name.to_string(),
+            database,
+            catalog: Catalog::new(),
+            journal: Mutex::new(Vec::new()),
+            write_gate: WriteGate::default(),
+        });
+        let template = self
+            .template
+            .as_deref()
+            .filter(|t| *t != name)
+            .and_then(|t| dbs.get(t).cloned());
+        if let Some(template) = template {
+            let conn = db.database.connect().map_err(engine_error)?;
+            let statements = template.journal.lock().clone();
+            conn.execute("BEGIN").map_err(engine_error)?;
+            for sql in &statements {
+                conn.execute(sql).map_err(engine_error)?;
+            }
+            conn.execute("COMMIT").map_err(engine_error)?;
+            for table in template.catalog.tables() {
+                db.catalog.register((*table).clone());
+            }
+            db.journal.lock().clone_from(&statements);
+        }
+        dbs.insert(name.to_string(), db.clone());
+        Ok(db)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnMeta {
+    pub name: String,
+    pub table: String,
+    /// MySQL type when the column traces back to a table column; otherwise
+    /// the type is taken from the values.
+    pub ty: Option<MyType>,
+}
+
+#[derive(Debug)]
+pub struct ResultSet {
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+#[derive(Debug)]
+pub enum Outcome {
+    Rows(ResultSet),
+    Ok {
+        affected_rows: u64,
+        last_insert_id: u64,
+    },
+}
+
+impl Outcome {
+    fn ok() -> Self {
+        Outcome::Ok {
+            affected_rows: 0,
+            last_insert_id: 0,
+        }
+    }
+}
+
+pub struct Session {
+    engine: Arc<Engine>,
+    db: Option<Arc<Db>>,
+    conn: Option<Arc<Connection>>,
+    in_transaction: bool,
+    /// Write statements of the open transaction, journaled on commit.
+    pending_journal: Vec<String>,
+}
+
+impl Session {
+    pub fn new(engine: Arc<Engine>) -> Self {
+        Self {
+            engine,
+            db: None,
+            conn: None,
+            in_transaction: false,
+            pending_journal: Vec::new(),
+        }
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
+    pub fn use_database(&mut self, name: &str) -> Result<()> {
+        if self.db.as_ref().is_some_and(|db| db.name == name) {
+            return Ok(());
+        }
+        self.rollback_open_transaction();
+        let db = self.engine.database(name)?;
+        let conn = db.database.connect().map_err(engine_error)?;
+        // Writers queue on the database's gate; this only covers engine-internal
+        // contention.
+        conn.set_busy_timeout(Duration::from_secs(1));
+        self.db = Some(db);
+        self.conn = Some(conn);
+        Ok(())
+    }
+
+    fn rollback_open_transaction(&mut self) {
+        if self.in_transaction {
+            if let Some(conn) = &self.conn {
+                let _ = conn.execute("ROLLBACK");
+            }
+            self.in_transaction = false;
+            self.pending_journal.clear();
+            if let Some(db) = &self.db {
+                db.write_gate.release();
+            }
+        }
+    }
+
+    /// Reset session state, as `COM_RESET_CONNECTION` does.
+    pub fn reset(&mut self) {
+        self.rollback_open_transaction();
+    }
+
+    /// Execute MySQL text. With several statements, the last outcome wins.
+    pub fn execute(&mut self, sql: &str) -> Result<Outcome> {
+        let Some(db) = self.db.clone() else {
+            // Statements that need no database (`SET`, `SELECT 1` on a bare
+            // connection) run against a scratch one.
+            self.use_database("mysql")?;
+            return self.execute(sql);
+        };
+        let statements =
+            rewrite(sql, &db.catalog).map_err(|e| MyError::new(1064, "42000", e.to_string()))?;
+        let mut outcome = Outcome::ok();
+        for stmt in statements {
+            outcome = self.execute_one(&db, stmt)?;
+        }
+        Ok(outcome)
+    }
+
+    fn conn(&self) -> &Arc<Connection> {
+        self.conn.as_ref().expect("database selected")
+    }
+
+    fn run(&self, sql: &str) -> Result<u64> {
+        let mut stmt = self.conn().prepare(sql).map_err(engine_error)?;
+        stmt.run_ignore_rows().map_err(engine_error)?;
+        Ok(stmt.n_change().max(0) as u64)
+    }
+
+    fn journal(&mut self, db: &Db, statements: &[String]) {
+        if self.in_transaction {
+            self.pending_journal.extend_from_slice(statements);
+        } else {
+            db.journal.lock().extend_from_slice(statements);
+        }
+    }
+
+    fn execute_one(&mut self, db: &Arc<Db>, stmt: Rewritten) -> Result<Outcome> {
+        match stmt.kind {
+            Kind::Noop => Ok(Outcome::ok()),
+            Kind::Use(name) => {
+                self.use_database(&name)?;
+                Ok(Outcome::ok())
+            }
+            Kind::Begin => {
+                if self.in_transaction {
+                    // START TRANSACTION implicitly commits an open one.
+                    self.commit(db)?;
+                }
+                // Writers are serialized: taking the write lock up front
+                // means a transaction never fails halfway on a lock upgrade.
+                db.write_gate.acquire()?;
+                if let Err(e) = self.run("BEGIN IMMEDIATE") {
+                    db.write_gate.release();
+                    return Err(e);
+                }
+                self.in_transaction = true;
+                Ok(Outcome::ok())
+            }
+            Kind::Commit => {
+                if self.in_transaction {
+                    self.commit(db)?;
+                }
+                Ok(Outcome::ok())
+            }
+            Kind::Rollback => {
+                if self.in_transaction {
+                    self.in_transaction = false;
+                    self.pending_journal.clear();
+                    let result = self.run("ROLLBACK");
+                    db.write_gate.release();
+                    result?;
+                }
+                Ok(Outcome::ok())
+            }
+            Kind::Query => {
+                let sql = stmt.sql.last().expect("query has a statement");
+                self.query(sql, &stmt.result_types).map(Outcome::Rows)
+            }
+            Kind::Dml => {
+                let (affected_rows, last_insert_id) = self.write(db, |session| {
+                    let mut affected_rows = 0;
+                    for sql in &stmt.sql {
+                        affected_rows = session.run(sql)?;
+                    }
+                    let last_insert_id = if stmt.auto_increment && affected_rows > 0 {
+                        session.conn().last_insert_rowid().max(0) as u64
+                    } else {
+                        0
+                    };
+                    Ok((affected_rows, last_insert_id))
+                })?;
+                self.journal(db, &stmt.sql);
+                Ok(Outcome::Ok {
+                    affected_rows,
+                    last_insert_id,
+                })
+            }
+            Kind::Ddl => {
+                self.write(db, |session| {
+                    for sql in &stmt.sql {
+                        session.run(sql)?;
+                    }
+                    Ok(())
+                })?;
+                if let Some(table) = stmt.table {
+                    db.catalog.register(table);
+                }
+                self.journal(db, &stmt.sql);
+                Ok(Outcome::ok())
+            }
+        }
+    }
+
+    fn commit(&mut self, db: &Db) -> Result<()> {
+        self.in_transaction = false;
+        let pending = std::mem::take(&mut self.pending_journal);
+        let result = self.run("COMMIT");
+        db.write_gate.release();
+        result?;
+        db.journal.lock().extend(pending);
+        Ok(())
+    }
+
+    /// Run a write. Inside a transaction the gate is already held; an
+    /// autocommit write takes it for the statement.
+    fn write<T>(&self, db: &Db, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if self.in_transaction {
+            return f(self);
+        }
+        db.write_gate.acquire()?;
+        let result = f(self);
+        db.write_gate.release();
+        result
+    }
+
+    fn query(&self, sql: &str, inferred: &[Option<MyType>]) -> Result<ResultSet> {
+        let mut stmt = self.conn().prepare(sql).map_err(engine_error)?;
+        let columns = (0..stmt.num_columns())
+            .map(|i| ColumnMeta {
+                name: stmt.get_column_name(i).to_string(),
+                table: stmt
+                    .get_column_table_name(i)
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+                // The statement-level type knows MySQL's expression typing;
+                // the declared type covers what inference could not resolve.
+                ty: inferred.get(i).copied().flatten().or_else(|| {
+                    stmt.get_column_decltype(i)
+                        .and_then(|decl| MyType::from_decl(&decl))
+                }),
+            })
+            .collect();
+        let rows = stmt.run_collect_rows().map_err(engine_error)?;
+        Ok(ResultSet { columns, rows })
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.rollback_open_transaction();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(outcome: Outcome) -> Vec<Vec<String>> {
+        match outcome {
+            Outcome::Rows(rs) => rs
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|v| v.to_string()).collect())
+                .collect(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn session(engine: &Arc<Engine>, db: &str) -> Session {
+        let mut s = Session::new(engine.clone());
+        s.use_database(db).unwrap();
+        s
+    }
+
+    #[test]
+    fn upsert_default_and_datetime() {
+        let engine = Engine::new(None);
+        let mut s = session(&engine, "t");
+        s.execute(
+            "CREATE TABLE `seq` (`userId` binary(12) NOT NULL, `prefix` varchar(15) NOT NULL DEFAULT 'default', \
+             `value` int unsigned NOT NULL DEFAULT 0, `at` datetime, PRIMARY KEY (`userId`, `prefix`))",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            s.execute(
+                "insert into `seq` (`userId`, `prefix`, `value`, `at`) values (X'0102', default, 1, '2026-10-02 16:02:43.985') \
+                 on duplicate key update `value` = `seq`.`value` + 1",
+            )
+            .unwrap();
+        }
+        let got = rows(
+            s.execute("select `prefix`, `value`, `at` from `seq`")
+                .unwrap(),
+        );
+        assert_eq!(got, vec![vec!["default", "3", "2026-10-02 16:02:44"]]);
+        let got = rows(
+            s.execute("select count(*) from seq where at > '2026-10-02T16:02:43.000Z'")
+                .unwrap(),
+        );
+        assert_eq!(got, vec![vec!["1"]]);
+    }
+
+    #[test]
+    fn auto_increment_and_template_clone() {
+        let engine = Engine::new(Some("base".to_string()));
+        let mut base = session(&engine, "base");
+        base.execute("CREATE TABLE `bank` (`id` int AUTO_INCREMENT, `label` varchar(100) NOT NULL, PRIMARY KEY (`id`), UNIQUE `u` (`label`))")
+            .unwrap();
+        let out = base
+            .execute("insert into `bank` (`id`, `label`) values (default, 'a')")
+            .unwrap();
+        assert!(matches!(
+            out,
+            Outcome::Ok {
+                affected_rows: 1,
+                last_insert_id: 1
+            }
+        ));
+
+        let mut a = session(&engine, "file_a");
+        let mut b = session(&engine, "file_b");
+        a.execute("insert into bank (label) values ('only-a')")
+            .unwrap();
+        assert_eq!(
+            rows(a.execute("select count(*) from bank").unwrap()),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows(b.execute("select count(*) from bank").unwrap()),
+            vec![vec!["1"]]
+        );
+
+        let dup = b
+            .execute("insert into bank (label) values ('a')")
+            .unwrap_err();
+        assert_eq!(dup.code, 1062);
+        b.execute("insert ignore into bank (label) values ('a')")
+            .unwrap();
+    }
+
+    #[test]
+    fn text_collation_is_unicode_and_case_insensitive() {
+        let engine = Engine::new(None);
+        let mut s = session(&engine, "t");
+        s.execute("CREATE TABLE p (id int NOT NULL, name varchar(255) NOT NULL, PRIMARY KEY (id), UNIQUE `u` (`name`))")
+            .unwrap();
+        for (i, name) in ["محمد", "پریچهر", "آیدین", "علی", "سارا", "Zed", "apple"]
+            .iter()
+            .enumerate()
+        {
+            s.execute(&format!("insert into p values ({i}, '{name}')"))
+                .unwrap();
+        }
+        let got = rows(s.execute("select name from p order by name").unwrap());
+        let got: Vec<&str> = got.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(
+            got,
+            ["apple", "Zed", "آیدین", "پریچهر", "سارا", "علی", "محمد"]
+        );
+        assert_eq!(
+            rows(
+                s.execute("select count(*) from p where name = 'APPLE'")
+                    .unwrap()
+            ),
+            vec![vec!["1"]]
+        );
+        assert_eq!(
+            s.execute("insert into p values (99, 'ZED')")
+                .unwrap_err()
+                .code,
+            1062
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_queue() {
+        let engine = Engine::new(None);
+        session(&engine, "t")
+            .execute("CREATE TABLE c (id int NOT NULL, n int NOT NULL, PRIMARY KEY (id))")
+            .unwrap();
+        session(&engine, "t")
+            .execute("insert into c values (1, 0)")
+            .unwrap();
+        let started = Instant::now();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    let mut s = session(&engine, "t");
+                    for i in 0..200 {
+                        if i % 2 == 0 {
+                            s.execute("begin").unwrap();
+                            s.execute("update c set n = n + 1 where id = 1").unwrap();
+                            s.execute("commit").unwrap();
+                        } else {
+                            s.execute("update c set n = n + 1 where id = 1").unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let mut s = session(&engine, "t");
+        assert_eq!(
+            rows(s.execute("select n from c").unwrap()),
+            vec![vec!["1600"]]
+        );
+        eprintln!("1600 contended writes in {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn transactions_and_division() {
+        let engine = Engine::new(None);
+        let mut s = session(&engine, "t");
+        s.execute("CREATE TABLE t (id int NOT NULL, n int NOT NULL, PRIMARY KEY (id))")
+            .unwrap();
+        s.execute("begin").unwrap();
+        s.execute("insert into t values (1, 7)").unwrap();
+        s.execute("rollback").unwrap();
+        assert_eq!(
+            rows(s.execute("select count(*) from t").unwrap()),
+            vec![vec!["0"]]
+        );
+        s.execute("begin").unwrap();
+        s.execute("insert into t values (1, 7)").unwrap();
+        s.execute("commit").unwrap();
+        assert_eq!(
+            rows(s.execute("select n / 2 from t").unwrap()),
+            vec![vec!["3.5"]]
+        );
+    }
+}

@@ -1,0 +1,53 @@
+{
+  "name": "@erfanium/mylite",
+  "version": "0.1.0",
+  "description": "In-memory, in-process MySQL for Node.js — a drop-in for mysql2/promise, backed by the Turso engine. No server, no socket.",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./promise": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib",
+    "prebuilds"
+  ],
+  "scripts": {
+    "build:native": "./scripts/build-native.sh",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "mysql2": "^3.15.1"
+  },
+  "keywords": [
+    "mysql",
+    "mysql2",
+    "in-memory",
+    "embedded",
+    "testing",
+    "turso"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erfanium/turso.git",
+    "directory": "mysql/packages/mylite"
+  },
+  "homepage": "https://github.com/erfanium/turso/tree/mysql-frontend/mysql/packages/mylite#readme",
+  "bugs": {
+    "url": "https://github.com/erfanium/turso/issues"
+  },
+  "author": "Erfan Safari"
+}

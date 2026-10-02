@@ -25,6 +25,9 @@ members = [
     "testing/sqlite_test_ext",
     "tests",
     "sqlite/parser",
+    "mysql/frontend",
+    "mysql/node",
+    "mysql/server",
     "postgres/cli",
     "postgres/client",
     "postgres/frontend",
@@ -117,6 +120,8 @@ turso_sync_engine = { path = "sync/engine", version = "0.8.0" }
 turso_ext = { path = "extensions/core", version = "0.8.0" }
 turso_macros = { path = "macros", version = "0.8.0" }
 turso_parser = { path = "sqlite/parser", version = "0.8.0" }
+turso_mysql = { path = "mysql/frontend", version = "0.8.0" }
+turso_mysql_server = { path = "mysql/server", version = "0.8.0" }
 turso_pg = { path = "postgres/frontend", version = "0.8.0" }
 turso_pg_client = { path = "postgres/client", version = "0.8.0" }
 turso_pg_parser = { path = "postgres/parser", version = "0.8.0" }

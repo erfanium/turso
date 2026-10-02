@@ -5101,6 +5101,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "recursive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0786a43debb760f491b1bc0269fe5e84155353c67482b9e60d0cfb596054b43e"
+dependencies = [
+ "recursive-proc-macro-impl",
+ "stacker",
+]
+
+[[package]]
+name = "recursive-proc-macro-impl"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b"
+dependencies = [
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6103,6 +6123,28 @@ dependencies = [
  "tracing",
  "turso_core",
  "turso_parser",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.61.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbf5ea8d4d7c808e1af1cbabebca9a2abe603bcefc22294c5b95018d53200cb7"
+dependencies = [
+ "log",
+ "recursive",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
 ]
 
 [[package]]
@@ -7234,6 +7276,38 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
+]
+
+[[package]]
+name = "turso_mysql"
+version = "0.8.0"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "serde_json",
+ "sqlparser",
+ "turso_core",
+ "turso_parser",
+]
+
+[[package]]
+name = "turso_mysql_node"
+version = "0.8.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "turso_mysql",
+ "turso_mysql_server",
+]
+
+[[package]]
+name = "turso_mysql_server"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "turso_core",
+ "turso_mysql",
 ]
 
 [[package]]

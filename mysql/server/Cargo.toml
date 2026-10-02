@@ -1,0 +1,25 @@
+[package]
+name = "turso_mysql_server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MySQL wire-protocol server for Turso"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tursomysql"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+turso_core = { workspace = true, default-features = true, features = [
+    "conn_raw_api",
+] }
+turso_mysql = { workspace = true }
+
+[lints]
+workspace = true

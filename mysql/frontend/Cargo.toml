@@ -1,0 +1,26 @@
+[package]
+name = "turso_mysql"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MySQL frontend for Turso"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { workspace = true, default-features = false, features = ["clock", "std"] }
+parking_lot = { workspace = true }
+sqlparser = { version = "0.61", features = ["visitor"] }
+turso_core = { workspace = true, default-features = true, features = [
+    "conn_raw_api",
+] }
+turso_parser = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[lints]
+workspace = true
