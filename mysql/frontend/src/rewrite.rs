@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, CreateTable, DataType, Expr,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Insert, ObjectName, OnInsert, Query,
-    SetExpr, SqliteOnConflict, Statement, TableConstraint, TableFactor, TableObject, Value,
+    AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, ColumnOption, CreateTable, DataType, Expr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Insert, ObjectName, ObjectType,
+    OnInsert, Query, SchemaName, SetExpr, SqliteOnConflict, Statement, TableConstraint, TableFactor, TableObject, Value,
     VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{GenericDialect, MySqlDialect};
@@ -38,7 +38,7 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 }
 
 /// What a rewritten statement is, as far as the session layer cares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Kind {
     /// Returns a result set.
     Query,
@@ -51,11 +51,16 @@ pub enum Kind {
     Rollback,
     /// `USE db`.
     Use(String),
+    /// `CREATE DATABASE` / `CREATE SCHEMA`.
+    CreateDatabase { name: String, if_not_exists: bool },
+    /// `DROP DATABASE` / `DROP SCHEMA`.
+    DropDatabase { name: String, if_exists: bool },
     /// Accepted and ignored (`SET NAMES`, ...).
+    #[default]
     Noop,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Rewritten {
     pub kind: Kind,
     /// Native statements to run in order. The last one produces the result.
@@ -68,19 +73,154 @@ pub struct Rewritten {
     /// MySQL types of the result columns of a query, where they can be
     /// derived from the statement.
     pub result_types: Vec<Option<MyType>>,
+    /// Tables a `DROP TABLE` removes from the catalog.
+    pub dropped_tables: Vec<String>,
+    /// Every row of the INSERT gets a generated id, so MySQL reports the
+    /// first one rather than the last.
+    pub first_insert_id: bool,
+    /// For an UPDATE: counts the matched rows the assignments will change,
+    /// run before the update to report `Changed:` as MySQL does.
+    pub changed_sql: Option<String>,
 }
 
 /// Rewrite one or more `;`-separated MySQL statements.
 pub fn rewrite(sql: &str, catalog: &Catalog) -> Result<Vec<Rewritten>> {
-    let stmts = Parser::parse_sql(&MySqlDialect {}, sql)
+    let (sql, update_orders) = split_update_order_by(sql);
+    let stmts = Parser::parse_sql(&MySqlDialect {}, &sql)
         .map_err(|e| RewriteError(format!("syntax error: {e}")))?;
     stmts
         .into_iter()
-        .map(|stmt| rewrite_statement(stmt, catalog))
+        .enumerate()
+        .map(|(i, stmt)| {
+            let order_by = update_orders.get(i).cloned().flatten();
+            rewrite_statement(stmt, catalog, order_by)
+        })
         .collect()
 }
 
-fn rewrite_statement(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten> {
+/// The parser does not accept `UPDATE ... ORDER BY`. Cut the clause out of
+/// each UPDATE and return it per statement, as written.
+fn split_update_order_by(sql: &str) -> (String, Vec<Option<String>>) {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    if !sql.to_ascii_lowercase().contains("order") {
+        return (sql.to_string(), Vec::new());
+    }
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize_with_location() else {
+        return (sql.to_string(), Vec::new());
+    };
+    // Byte offset of each (line, column) location; columns count characters.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |line: u64, column: u64| -> usize {
+        let start = line_starts.get(line.saturating_sub(1) as usize).copied().unwrap_or(sql.len());
+        sql[start..]
+            .char_indices()
+            .nth(column.saturating_sub(1) as usize)
+            .map_or(sql.len(), |(i, _)| start + i)
+    };
+    let keyword = |t: &Token, kw: &str| {
+        matches!(t, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(kw))
+    };
+    let mut orders = Vec::new();
+    let mut cuts = Vec::new();
+    let mut first_word: Option<bool> = None;
+    let mut depth = 0i32;
+    let mut current: Option<String> = None;
+    let mut open: Option<(usize, usize)> = None; // (cut start, clause start)
+    let significant: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+        .collect();
+    for (k, &i) in significant.iter().enumerate() {
+        let t = &tokens[i].token;
+        let here = offset(tokens[i].span.start.line, tokens[i].span.start.column);
+        let ends_clause = matches!(t, Token::SemiColon | Token::EOF) && depth == 0
+            || keyword(t, "LIMIT") && depth == 0;
+        if ends_clause {
+            if let Some((cut, clause)) = open.take() {
+                current = Some(sql[clause..here].trim().to_string());
+                cuts.push((cut, here));
+            }
+        }
+        match t {
+            Token::SemiColon | Token::EOF if depth == 0 => {
+                orders.push(current.take());
+                first_word = None;
+                continue;
+            }
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+        if first_word.is_none() {
+            first_word = Some(keyword(t, "UPDATE"));
+        }
+        if first_word == Some(true) && depth == 0 && open.is_none() && keyword(t, "ORDER") {
+            if let Some(&by) = significant.get(k + 1).filter(|&&j| keyword(&tokens[j].token, "BY")) {
+                let clause = offset(tokens[by].span.end.line, tokens[by].span.end.column);
+                open = Some((here, clause));
+            }
+        }
+    }
+    if let Some((cut, clause)) = open.take() {
+        current = Some(sql[clause..].trim().to_string());
+        cuts.push((cut, sql.len()));
+    }
+    if current.is_some() {
+        orders.push(current.take());
+    }
+    if cuts.is_empty() {
+        return (sql.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (start, end) in cuts {
+        out.push_str(&sql[last..start]);
+        out.push(' ');
+        last = end;
+    }
+    out.push_str(&sql[last..]);
+    (out, orders)
+}
+
+fn backtick(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// `rowid IN (SELECT rowid FROM t WHERE ... ORDER BY ... LIMIT n)`: how a
+/// single-table UPDATE/DELETE with ORDER BY or LIMIT runs natively.
+fn rowid_selection(
+    table: &str,
+    alias: Option<&str>,
+    selection: Option<&Expr>,
+    order_by: Option<&str>,
+    limit: Option<&Expr>,
+) -> Result<Expr> {
+    let mut sql = format!("rowid IN (SELECT rowid FROM {}", backtick(table));
+    if let Some(alias) = alias {
+        sql.push_str(&format!(" AS {}", backtick(alias)));
+    }
+    if let Some(sel) = selection {
+        sql.push_str(&format!(" WHERE {sel}"));
+    }
+    if let Some(order) = order_by.filter(|o| !o.is_empty()) {
+        sql.push_str(&format!(" ORDER BY {order}"));
+    }
+    if let Some(limit) = limit {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    sql.push(')');
+    Parser::new(&MySqlDialect {})
+        .try_with_sql(&sql)
+        .and_then(|mut p| p.parse_expr())
+        .map_err(|e| RewriteError(format!("internal expression `{sql}`: {e}")))
+}
+
+fn rewrite_statement(
+    mut stmt: Statement,
+    catalog: &Catalog,
+    update_order_by: Option<String>,
+) -> Result<Rewritten> {
     match stmt {
         Statement::StartTransaction { .. } => Ok(simple(Kind::Begin, "BEGIN")),
         Statement::Commit { .. } => Ok(simple(Kind::Commit, "COMMIT")),
@@ -108,6 +248,7 @@ fn rewrite_statement(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten
             table: None,
             auto_increment: false,
             result_types: Vec::new(),
+            ..Default::default()
         }),
         Statement::Use(ref u) => {
             let name = u.to_string();
@@ -121,11 +262,72 @@ fn rewrite_statement(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten
                 table: None,
                 auto_increment: false,
                 result_types: Vec::new(),
+                ..Default::default()
             })
         }
         Statement::CreateTable(ref ct) => create_table(ct),
+        // Foreign keys are not kept: CREATE TABLE drops them too.
+        Statement::AlterTable(ref at)
+            if !at.operations.is_empty()
+                && at.operations.iter().all(|op| {
+                    matches!(
+                        op,
+                        AlterTableOperation::AddConstraint {
+                            constraint: TableConstraint::ForeignKey(_),
+                            ..
+                        }
+                    )
+                }) =>
+        {
+            Ok(simple_kind(Kind::Noop))
+        }
+        Statement::CreateDatabase {
+            ref db_name,
+            if_not_exists,
+            ..
+        } => Ok(simple_kind(Kind::CreateDatabase {
+            name: object_name_last(db_name),
+            if_not_exists,
+        })),
+        Statement::CreateSchema {
+            schema_name: SchemaName::Simple(ref name) | SchemaName::NamedAuthorization(ref name, _),
+            if_not_exists,
+            ..
+        } => Ok(simple_kind(Kind::CreateDatabase {
+            name: object_name_last(name),
+            if_not_exists,
+        })),
+        Statement::Drop {
+            object_type: ObjectType::Database | ObjectType::Schema,
+            if_exists,
+            ref names,
+            ..
+        } => match names.as_slice() {
+            [name] => Ok(simple_kind(Kind::DropDatabase {
+                name: object_name_last(name),
+                if_exists,
+            })),
+            _ => err("DROP DATABASE takes exactly one name"),
+        },
         Statement::Drop { .. } | Statement::CreateIndex(_) | Statement::Truncate(_) => {
             ddl_passthrough(stmt)
+        }
+        // `WITH ... DELETE/UPDATE/INSERT` parses as a query but returns no rows.
+        Statement::Query(ref query)
+            if matches!(
+                *query.body,
+                SetExpr::Delete(_) | SetExpr::Update(_) | SetExpr::Insert(_)
+            ) =>
+        {
+            rewrite_exprs(&mut stmt)?;
+            Ok(Rewritten {
+                kind: Kind::Dml,
+                sql: vec![stmt.to_string()],
+                table: None,
+                auto_increment: false,
+                result_types: Vec::new(),
+                ..Default::default()
+            })
         }
         Statement::Query(ref mut query) => {
             // Types come from the MySQL statement, before it is rewritten.
@@ -138,24 +340,27 @@ fn rewrite_statement(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten
                 table: None,
                 auto_increment: false,
                 result_types,
+                ..Default::default()
             })
         }
         Statement::Insert(_) => insert(stmt, catalog),
-        Statement::Update(_) => update(stmt, catalog),
-        Statement::Delete(_) => {
-            rewrite_exprs(&mut stmt)?;
-            Ok(Rewritten {
-                kind: Kind::Dml,
-                sql: vec![stmt.to_string()],
-                table: None,
-                auto_increment: false,
-                result_types: Vec::new(),
-            })
-        }
+        Statement::Update(_) => update(stmt, catalog, update_order_by),
+        Statement::Delete(_) => delete(stmt),
         other => err(format!(
             "unsupported statement: {}",
             other.to_string().chars().take(80).collect::<String>()
         )),
+    }
+}
+
+fn simple_kind(kind: Kind) -> Rewritten {
+    Rewritten {
+        kind,
+        sql: vec![],
+        table: None,
+        auto_increment: false,
+        result_types: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -166,6 +371,7 @@ fn simple(kind: Kind, sql: &str) -> Rewritten {
         table: None,
         auto_increment: false,
         result_types: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -176,7 +382,31 @@ fn ddl_passthrough(stmt: Statement) -> Result<Rewritten> {
             .iter()
             .map(|t| format!("DELETE FROM {}", quote_ident(&object_name_last(&t.name))))
             .collect(),
+        // The engine drops one table per statement.
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            if_exists,
+            names,
+            ..
+        } if names.len() > 1 => names
+            .iter()
+            .map(|n| {
+                format!(
+                    "DROP TABLE {}{}",
+                    if *if_exists { "IF EXISTS " } else { "" },
+                    quote_ident(&object_name_last(n))
+                )
+            })
+            .collect(),
         _ => vec![stmt.to_string()],
+    };
+    let dropped_tables = match &stmt {
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names,
+            ..
+        } => names.iter().map(object_name_last).collect(),
+        _ => Vec::new(),
     };
     let kind = if matches!(stmt, Statement::Truncate(_)) {
         Kind::Dml
@@ -186,9 +416,8 @@ fn ddl_passthrough(stmt: Statement) -> Result<Rewritten> {
     Ok(Rewritten {
         kind,
         sql,
-        table: None,
-        auto_increment: false,
-        result_types: Vec::new(),
+        dropped_tables,
+        ..Default::default()
     })
 }
 
@@ -357,6 +586,8 @@ fn coerce_for_column(expr: Expr, col: &ColumnInfo) -> Result<Expr> {
             wrap_fn("mysql_datetime", expr, &format!(", {fsp}"))
         }
         MyType::Date => wrap_fn("mysql_date", expr, ""),
+        MyType::Time { fsp } => wrap_fn("mysql_time", expr, &format!(", {fsp}")),
+        MyType::Year => wrap_fn("mysql_year", expr, ""),
         MyType::Decimal { scale, .. } => wrap_fn("mysql_decimal", expr, &format!(", {scale}")),
         _ => Ok(expr),
     }
@@ -554,6 +785,10 @@ fn insert(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten> {
         ins.or = Some(SqliteOnConflict::Ignore);
     }
 
+    // MySQL reports the first generated id of a multi-row insert. That is
+    // last - rows + 1 only when every row generated its id.
+    let first_insert_id =
+        ins.or.is_none() && ins.on.is_none() && all_ids_generated(ins, table.as_deref());
     coerce_insert_rows(ins, table.as_deref())?;
 
     let on_duplicate = match ins.on.take() {
@@ -584,7 +819,33 @@ fn insert(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten> {
         auto_increment: table
             .as_deref()
             .is_some_and(|t| t.columns.iter().any(|c| c.auto_increment)),
+        first_insert_id,
         result_types: Vec::new(),
+        ..Default::default()
+    })
+}
+
+/// Whether a VALUES insert leaves the AUTO_INCREMENT column to the engine
+/// in every row: the column is not listed, or is given DEFAULT or NULL.
+fn all_ids_generated(ins: &Insert, table: Option<&TableInfo>) -> bool {
+    let Some(table) = table else { return false };
+    let Some(ai) = table.columns.iter().position(|c| c.auto_increment) else {
+        return false;
+    };
+    let Some(SetExpr::Values(values)) = ins.source.as_ref().map(|q| q.body.as_ref()) else {
+        return false;
+    };
+    let position = if ins.columns.is_empty() {
+        Some(ai)
+    } else {
+        let name = &table.columns[ai].name;
+        ins.columns.iter().position(|c| c.value.eq_ignore_ascii_case(name))
+    };
+    let Some(position) = position else { return true };
+    values.rows.iter().all(|row| {
+        row.get(position).is_some_and(|e| {
+            is_default_keyword(e) || e.to_string().eq_ignore_ascii_case("NULL")
+        })
     })
 }
 
@@ -620,22 +881,110 @@ fn coerce_insert_rows(ins: &mut Insert, table: Option<&TableInfo>) -> Result<()>
     Ok(())
 }
 
-fn update(mut stmt: Statement, catalog: &Catalog) -> Result<Rewritten> {
+fn update(
+    mut stmt: Statement,
+    catalog: &Catalog,
+    order_by: Option<String>,
+) -> Result<Rewritten> {
+    let Statement::Update(upd) = &mut stmt else {
+        unreachable!()
+    };
+    let single = match &upd.table.relation {
+        TableFactor::Table { name, alias, .. }
+            if upd.table.joins.is_empty() && upd.from.is_none() =>
+        {
+            Some((object_name_last(name), alias.as_ref().map(|a| a.name.value.clone())))
+        }
+        _ => None,
+    };
+    if order_by.is_some() || upd.limit.is_some() {
+        let Some((table, alias)) = &single else {
+            return err("UPDATE with ORDER BY or LIMIT needs a single table");
+        };
+        upd.selection = Some(rowid_selection(
+            table,
+            alias.as_deref(),
+            upd.selection.as_ref(),
+            order_by.as_deref(),
+            upd.limit.as_ref(),
+        )?);
+        upd.limit = None;
+    }
     rewrite_exprs(&mut stmt)?;
     let Statement::Update(upd) = &mut stmt else {
         unreachable!()
     };
-    let table = match &upd.table.relation {
-        TableFactor::Table { name, .. } => catalog.table(&object_name_last(name)),
-        _ => None,
-    };
+    let table = single.as_ref().and_then(|(name, _)| catalog.table(name));
     coerce_assignments(&mut upd.assignments, table.as_deref())?;
+
+    // A matched row is changed when any assigned value differs, compared
+    // byte for byte as MySQL does.
+    let changed_sql = single.as_ref().map(|(name, alias)| {
+        let unchanged = upd
+            .assignments
+            .iter()
+            .map(|a| format!("{} IS ({}) COLLATE BINARY", a.target, a.value))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(
+            "SELECT count(*) FROM {}{} WHERE ({}) AND NOT ({})",
+            backtick(name),
+            alias.as_ref().map(|a| format!(" AS {}", backtick(a))).unwrap_or_default(),
+            upd.selection.as_ref().map_or("1".to_string(), |s| s.to_string()),
+            if unchanged.is_empty() { "1".to_string() } else { unchanged },
+        )
+    });
     Ok(Rewritten {
         kind: Kind::Dml,
         sql: vec![stmt.to_string()],
-        table: None,
-        auto_increment: false,
-        result_types: Vec::new(),
+        changed_sql,
+        ..Default::default()
+    })
+}
+
+fn delete(mut stmt: Statement) -> Result<Rewritten> {
+    let Statement::Delete(del) = &mut stmt else {
+        unreachable!()
+    };
+    if !del.order_by.is_empty() || del.limit.is_some() {
+        let (sqlparser::ast::FromTable::WithFromKeyword(from)
+        | sqlparser::ast::FromTable::WithoutKeyword(from)) = &del.from;
+        let table = match from.as_slice() {
+            [t] if t.joins.is_empty() && del.using.is_none() && del.tables.is_empty() => {
+                match &t.relation {
+                    TableFactor::Table { name, alias, .. } => Some((
+                        object_name_last(name),
+                        alias.as_ref().map(|a| a.name.value.clone()),
+                    )),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((table, alias)) = table else {
+            return err("DELETE with ORDER BY or LIMIT needs a single table");
+        };
+        let order = del
+            .order_by
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        del.selection = Some(rowid_selection(
+            &table,
+            alias.as_deref(),
+            del.selection.as_ref(),
+            Some(&order),
+            del.limit.as_ref(),
+        )?);
+        del.order_by.clear();
+        del.limit = None;
+    }
+    rewrite_exprs(&mut stmt)?;
+    Ok(Rewritten {
+        kind: Kind::Dml,
+        sql: vec![stmt.to_string()],
+        ..Default::default()
     })
 }
 
@@ -675,6 +1024,11 @@ fn my_type(data_type: &DataType) -> Result<MyType> {
         "mediumint" => MyType::Int { bytes: 3, unsigned },
         "int" | "integer" => MyType::Int { bytes: 4, unsigned },
         "bigint" => MyType::Int { bytes: 8, unsigned },
+        // SERIAL is BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE.
+        "serial" => MyType::Int {
+            bytes: 8,
+            unsigned: true,
+        },
         "decimal" | "numeric" | "dec" => MyType::Decimal {
             precision: args.first().copied().unwrap_or(10),
             scale: args.get(1).copied().unwrap_or(0),
@@ -693,11 +1047,19 @@ fn my_type(data_type: &DataType) -> Result<MyType> {
             fsp: args.first().copied().unwrap_or(0),
         },
         "date" => MyType::Date,
-        "time" => MyType::Time,
+        "time" => MyType::Time {
+            fsp: args.first().copied().unwrap_or(0),
+        },
+        "year" => MyType::Year,
         "json" => MyType::Json,
         "enum" | "set" => MyType::Enum,
         other => return err(format!("unsupported column type `{other}`")),
     })
+}
+
+fn data_type_base(data_type: &DataType) -> String {
+    let text = data_type.to_string().to_ascii_lowercase();
+    text.split(['(', ' ']).next().unwrap_or("").to_string()
 }
 
 fn default_sql(expr: &Expr) -> String {
@@ -743,6 +1105,10 @@ fn create_table(ct: &CreateTable) -> Result<Rewritten> {
         let mut auto_increment = false;
         let mut inline_pk = false;
         let mut binary_collation = false;
+        if data_type_base(&col.data_type) == "serial" {
+            not_null = true;
+            auto_increment = true;
+        }
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => not_null = true,
@@ -881,6 +1247,7 @@ fn create_table(ct: &CreateTable) -> Result<Rewritten> {
         ),
         auto_increment: false,
         result_types: Vec::new(),
+        ..Default::default()
     })
 }
 

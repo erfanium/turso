@@ -200,7 +200,7 @@ fn scale_of(ty: MyType) -> u32 {
 fn is_temporal(ty: MyType) -> bool {
     matches!(
         ty,
-        MyType::Datetime { .. } | MyType::Timestamp { .. } | MyType::Date | MyType::Time
+        MyType::Datetime { .. } | MyType::Timestamp { .. } | MyType::Date | MyType::Time { .. }
     )
 }
 

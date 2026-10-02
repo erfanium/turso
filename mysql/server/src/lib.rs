@@ -54,6 +54,7 @@ const TYPE_INT24: u8 = 9;
 const TYPE_DATE: u8 = 10;
 const TYPE_TIME: u8 = 11;
 const TYPE_DATETIME: u8 = 12;
+const TYPE_YEAR: u8 = 13;
 const TYPE_JSON: u8 = 245;
 const TYPE_NEWDECIMAL: u8 = 246;
 const TYPE_BLOB: u8 = 252;
@@ -109,12 +110,20 @@ impl<R: Read, W: Write> Wire<R, W> {
         self.writer.flush()
     }
 
-    fn write_ok(&mut self, affected: u64, last_insert_id: u64, status: u16) -> io::Result<()> {
+    fn write_ok(
+        &mut self,
+        affected: u64,
+        last_insert_id: u64,
+        status: u16,
+        info: &str,
+    ) -> io::Result<()> {
         let mut p = vec![0x00];
         put_lenenc_int(&mut p, affected);
         put_lenenc_int(&mut p, last_insert_id);
         p.extend_from_slice(&status.to_le_bytes());
         p.extend_from_slice(&0u16.to_le_bytes());
+        // Without CLIENT_SESSION_TRACK the info string runs to the end.
+        p.extend_from_slice(info.as_bytes());
         self.write_packet(&p)
     }
 
@@ -316,7 +325,11 @@ fn wire_column(meta: &ColumnMeta, rows: &[Vec<Value>], index: usize) -> WireColu
             ..binary(TYPE_TIMESTAMP)
         },
         Some(MyType::Date) => binary(TYPE_DATE),
-        Some(MyType::Time) => binary(TYPE_TIME),
+        Some(MyType::Time { fsp }) => WireColumn {
+            decimals: fsp as u8,
+            ..binary(TYPE_TIME)
+        },
+        Some(MyType::Year) => numeric(TYPE_YEAR, true),
         Some(MyType::Json) => binary(TYPE_JSON),
         None => {
             let sample = rows
@@ -454,7 +467,7 @@ pub fn serve<R: Read, W: Write>(
             wire.write_err(&e)?;
             return wire.flush();
         }
-        _ => wire.write_ok(0, 0, STATUS_AUTOCOMMIT)?,
+        _ => wire.write_ok(0, 0, STATUS_AUTOCOMMIT, "")?,
     }
     wire.flush()?;
 
@@ -473,7 +486,7 @@ pub fn serve<R: Read, W: Write>(
             0x01 => return Ok(()),
             // COM_INIT_DB
             0x02 => match session.use_database(&String::from_utf8_lossy(body)) {
-                Ok(()) => wire.write_ok(0, 0, status(&session))?,
+                Ok(()) => wire.write_ok(0, 0, status(&session), "")?,
                 Err(e) => wire.write_err(&e)?,
             },
             // COM_QUERY
@@ -490,19 +503,20 @@ pub fn serve<R: Read, W: Write>(
                     Ok(Outcome::Ok {
                         affected_rows,
                         last_insert_id,
-                    }) => wire.write_ok(affected_rows, last_insert_id, status(&session))?,
+                        info,
+                    }) => wire.write_ok(affected_rows, last_insert_id, status(&session), &info)?,
                     Ok(Outcome::Rows(rs)) => write_result_set(&mut wire, &rs, status(&session))?,
                     Err(e) => wire.write_err(&e)?,
                 }
             }
             // COM_PING
-            0x0e => wire.write_ok(0, 0, status(&session))?,
+            0x0e => wire.write_ok(0, 0, status(&session), "")?,
             // COM_STMT_CLOSE has no response.
             0x19 => continue,
             // COM_RESET_CONNECTION
             0x1f => {
                 session.reset();
-                wire.write_ok(0, 0, status(&session))?
+                wire.write_ok(0, 0, status(&session), "")?
             }
             other => wire.write_err(&MyError {
                 code: 1047,

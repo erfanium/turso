@@ -23,7 +23,8 @@ pub enum MyType {
     Datetime { fsp: u32 },
     Timestamp { fsp: u32 },
     Date,
-    Time,
+    Time { fsp: u32 },
+    Year,
     Json,
     Enum,
 }
@@ -61,7 +62,8 @@ impl MyType {
             MyType::Datetime { fsp } => format!("DATETIME_TEXT_{fsp}"),
             MyType::Timestamp { fsp } => format!("TIMESTAMP_TEXT_{fsp}"),
             MyType::Date => "DATE_TEXT".to_string(),
-            MyType::Time => "TIME_TEXT".to_string(),
+            MyType::Time { fsp } => format!("TIME_TEXT_{fsp}"),
+            MyType::Year => "YEAR".to_string(),
             MyType::Json => "JSON_TEXT".to_string(),
             MyType::Enum => "ENUM_TEXT".to_string(),
         }
@@ -105,7 +107,8 @@ impl MyType {
             "DATETIME_TEXT" => MyType::Datetime { fsp: arg(0) },
             "TIMESTAMP_TEXT" => MyType::Timestamp { fsp: arg(0) },
             "DATE_TEXT" => MyType::Date,
-            "TIME_TEXT" => MyType::Time,
+            "TIME_TEXT" => MyType::Time { fsp: arg(0) },
+            "YEAR" => MyType::Year,
             "JSON_TEXT" => MyType::Json,
             "ENUM_TEXT" => MyType::Enum,
             _ => return None,
@@ -176,6 +179,12 @@ impl Catalog {
             .write()
             .entry(key)
             .or_insert_with(|| Arc::new(table));
+    }
+
+    /// Register a table that was just created, replacing a stale entry.
+    pub fn replace(&self, table: TableInfo) {
+        let key = table.name.to_ascii_lowercase();
+        self.tables.write().insert(key, Arc::new(table));
     }
 
     pub fn remove(&self, name: &str) {

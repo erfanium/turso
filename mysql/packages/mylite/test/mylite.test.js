@@ -77,3 +77,47 @@ test('exports mirror mysql2', () => {
   assert.equal(mysql.PromisePool, real.PromisePool);
   assert.equal(typeof mysql.format, 'function');
 });
+
+test('DML over the wire: insertId, changedRows, ORDER BY/LIMIT, TIME and YEAR', async () => {
+  const db = new mysql.MyLite();
+  await db.query('create table u (id serial primary key, name varchar(20) not null, at time(1), y year)');
+
+  const [multi] = await db.query('insert into u (name, at, y) values (?, ?, ?), (?, ?, ?)', [
+    'b', '12:12:12', 22,
+    'a', '01:02:03.45', '1999',
+  ]);
+  assert.equal(multi.insertId, 1);
+  assert.equal(multi.affectedRows, 2);
+
+  const [changed] = await db.query('update u set name = ? where id = ?', ['c', 1]);
+  assert.equal(changed.affectedRows, 1);
+  assert.equal(changed.changedRows, 1);
+  const [same] = await db.query('update u set name = ? where id = ?', ['c', 1]);
+  assert.equal(same.affectedRows, 1);
+  assert.equal(same.changedRows, 0);
+
+  await db.query('update u set name = ? order by name asc limit 1', ['first']);
+  const [rows] = await db.query('select id, name, at, y from u order by id');
+  assert.deepEqual(rows, [
+    { id: 1, name: 'c', at: '12:12:12.0', y: 2022 },
+    { id: 2, name: 'first', at: '01:02:03.5', y: 1999 },
+  ]);
+
+  const [deleted] = await db.query('delete from u order by id desc limit 1');
+  assert.equal(deleted.affectedRows, 1);
+
+  // WITH ... DELETE answers with an OK packet, so the connection stays usable.
+  await db.query('with t as (select max(id) as m from u) delete from u where id = (select m from t)');
+  const [[{ n }]] = await db.query('select count(*) as n from u');
+  assert.equal(n, 0);
+
+  await db.close();
+});
+
+test('DROP DATABASE then CREATE DATABASE starts empty', async () => {
+  const conn = await mysql.createConnection({ database: 'recreate', multipleStatements: true });
+  await conn.query('create table t (id int primary key)');
+  await conn.query('drop database if exists recreate; create database recreate; use recreate;');
+  await assert.rejects(conn.query('select * from t'), { code: 'ER_NO_SUCH_TABLE' });
+  await conn.end();
+});

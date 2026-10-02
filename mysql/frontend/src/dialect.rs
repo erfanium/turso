@@ -71,8 +71,13 @@ impl Dialect for MysqlDialect {
 
 /// Open a fresh in-memory database that speaks the MySQL dialect.
 pub fn open_memory_database(name: &str) -> Result<Arc<Database>> {
+    // The engine shares open databases by path, so a dropped database that a
+    // session still holds would come back under its name. Every database
+    // instance gets its own path.
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
-    let path = format!("mysql-{name}.db");
+    let path = format!("mysql-{name}-{id}.db");
     let flags = turso_core::OpenFlags::default();
     let file = io.open_file(&path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
@@ -96,6 +101,8 @@ fn is_mysql_function(name: &str, argc: usize) -> bool {
         "truncate" => &[2],
         "mysql_datetime" => &[2],
         "mysql_date" => &[1],
+        "mysql_time" => &[2],
+        "mysql_year" => &[1],
         "mysql_decimal" => &[2],
         _ => return false,
     };
@@ -157,6 +164,66 @@ pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
 
 /// Render `dt` rounded to `fsp` fractional digits, without trailing zeros,
 /// which is the canonical stored form (see `rewrite::normalize_datetime_literal`).
+/// Parse a MySQL TIME value (`[-]H:MM:SS[.frac]`, a datetime, or an
+/// `HHMMSS` number) into signed microseconds.
+pub fn parse_time_micros(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Some(dt) = parse_datetime(s).filter(|_| s.contains('-') && s.len() > 8) {
+        let t = dt.time();
+        use chrono::Timelike;
+        return Some(
+            (t.num_seconds_from_midnight() as i64) * 1_000_000 + (t.nanosecond() / 1000) as i64,
+        );
+    }
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+    let parts: Vec<&str> = whole.split(':').collect();
+    let num = |p: &str| p.parse::<i64>().ok();
+    let (h, m, sec) = match parts.as_slice() {
+        [h, m, sec] => (num(h)?, num(m)?, num(sec)?),
+        [h, m] => (num(h)?, num(m)?, 0),
+        [n] => {
+            let n = num(n)?;
+            (n / 10000, n / 100 % 100, n % 100)
+        }
+        _ => return None,
+    };
+    if m > 59 || sec > 59 || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut digits: String = frac.chars().take(7).collect();
+    while digits.len() < 7 {
+        digits.push('0');
+    }
+    // Seven digits, so the sub-microsecond digit rounds.
+    let frac_micros = (digits.parse::<i64>().unwrap_or(0) + 5) / 10;
+    let micros = ((h * 60 + m) * 60 + sec) * 1_000_000 + frac_micros;
+    Some(if neg { -micros } else { micros })
+}
+
+/// Format signed microseconds as a TIME value with `fsp` fractional digits.
+pub fn format_time(micros: i64, fsp: u32) -> String {
+    let unit = 10i64.pow(6 - fsp);
+    let abs = micros.abs();
+    let rounded = (abs + unit / 2) / unit * unit;
+    let secs = rounded / 1_000_000;
+    let mut out = format!(
+        "{}{:02}:{:02}:{:02}",
+        if micros < 0 { "-" } else { "" },
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    );
+    if fsp > 0 {
+        let frac = (rounded % 1_000_000) / unit;
+        out.push_str(&format!(".{frac:0width$}", width = fsp as usize));
+    }
+    out
+}
+
 pub fn format_datetime(dt: NaiveDateTime, fsp: u32) -> String {
     let fsp = fsp.min(6);
     let unit = 10i64.pow(6 - fsp);
@@ -261,6 +328,37 @@ fn exec(name: &str, args: &[Value]) -> Result<Value> {
                 None => arg(0).clone(),
             },
             other => other.clone(),
+        },
+        "mysql_time" => {
+            let fsp = arg_i64(arg(1)).unwrap_or(0).clamp(0, 6) as u32;
+            match arg(0) {
+                Value::Null | Value::Blob(_) => arg(0).clone(),
+                v => match arg_text(v).and_then(|t| parse_time_micros(&t)) {
+                    Some(micros) => text(format_time(micros, fsp)),
+                    None => v.clone(),
+                },
+            }
+        }
+        "mysql_year" => match arg(0) {
+            Value::Null | Value::Blob(_) => arg(0).clone(),
+            v => {
+                let raw = arg_text(v).unwrap_or_default();
+                let raw = raw.trim();
+                match raw.parse::<f64>() {
+                    // A numeric 0 is the zero year; the string '0' or '00' is 2000.
+                    Ok(n) if n == 0.0 && !matches!(v, Value::Text(_)) => Value::from_i64(0),
+                    Ok(n) => {
+                        let n = n.round() as i64;
+                        let two_digit = raw.trim_start_matches('-').split('.').next().unwrap_or("").len() <= 2;
+                        Value::from_i64(match n {
+                            0..=69 if two_digit => 2000 + n,
+                            70..=99 if two_digit => 1900 + n,
+                            n => n,
+                        })
+                    }
+                    Err(_) => v.clone(),
+                }
+            }
         },
         "mysql_decimal" => {
             let scale = arg_i64(arg(1)).unwrap_or(0).max(0) as usize;
